@@ -1,6 +1,7 @@
 """Fetch + process GitHub repos for LLM consumption."""
 
 import asyncio, os, re, subprocess, logging
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
@@ -15,8 +16,8 @@ class Config:
     api_base: str = "https://api.github.com"
     ctx_budget: int = 100_000
     file_cap: int = 15_000
-    max_fetch: int = 80
-    concurrency: int = 10
+    max_fetch: int = 40
+    concurrency: int = 3
     big_file: int = 100_000
 
 CFG = Config()
@@ -150,16 +151,47 @@ def _token() -> str | None:
     return None
 
 def _headers() -> dict[str, str]:
-    h = {"Accept": "application/vnd.github+json"}
+    h = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "github-repo-summarizer",
+    }
     tok = _token()
     if tok: h["Authorization"] = f"Bearer {tok}"
     return h
+
+def _rate_limit_details(r: httpx.Response) -> str:
+    remaining = r.headers.get("X-RateLimit-Remaining")
+    limit = r.headers.get("X-RateLimit-Limit")
+    reset = r.headers.get("X-RateLimit-Reset")
+    resource = r.headers.get("X-RateLimit-Resource")
+    retry_after = r.headers.get("Retry-After")
+    parts: list[str] = []
+    if remaining is not None: parts.append(f"remaining={remaining}")
+    if limit is not None: parts.append(f"limit={limit}")
+    if resource is not None: parts.append(f"resource={resource}")
+    if reset and reset.isdigit():
+        dt = datetime.fromtimestamp(int(reset), tz=timezone.utc)
+        parts.append(f"reset_utc={dt.isoformat()}")
+    if retry_after is not None: parts.append(f"retry_after={retry_after}s")
+    return " ".join(parts)
+
+def _maybe_rate_limit(r: httpx.Response, ctx: str) -> PermissionError | None:
+    if r.status_code in (403, 429):
+        txt = (r.text or "").lower()
+        if "rate limit" in txt or r.headers.get("X-RateLimit-Remaining") == "0":
+            details = _rate_limit_details(r)
+            msg = f"GitHub rate limit hit during {ctx}."
+            if details: msg = f"{msg} {details}"
+            return PermissionError(msg)
+    return None
 
 
 # ── github api calls ───────────────────────────────────────────────────────
 
 async def _meta(http, hdrs, owner, repo) -> dict:
     r = await http.get(f"{CFG.api_base}/repos/{owner}/{repo}", headers=hdrs)
+    rl = _maybe_rate_limit(r, "repo metadata fetch")
+    if rl: raise rl
     if r.status_code == 404:
         raise FileNotFoundError(f"Repo '{owner}/{repo}' not found or is private.")
     if r.status_code == 403:
@@ -173,6 +205,8 @@ async def _meta(http, hdrs, owner, repo) -> dict:
 
 async def _tree(http, hdrs, owner, repo, branch) -> list[dict]:
     r = await http.get(f"{CFG.api_base}/repos/{owner}/{repo}/git/trees/{branch}?recursive=1", headers=hdrs)
+    rl = _maybe_rate_limit(r, "tree fetch")
+    if rl: raise rl
     if r.status_code != 200:
         raise RuntimeError(f"Tree fetch failed ({r.status_code}): {r.text[:300]}")
     return r.json().get("tree", [])
@@ -181,7 +215,11 @@ async def _get_file(http, hdrs, owner, repo, path, branch) -> str | None:
     h = {**hdrs, "Accept": "application/vnd.github.raw+json"}
     try:
         r = await http.get(f"{CFG.api_base}/repos/{owner}/{repo}/contents/{path}?ref={branch}", headers=h)
+        rl = _maybe_rate_limit(r, f"content fetch for {path}")
+        if rl: raise rl
         return r.text if r.status_code == 200 else None
+    except PermissionError:
+        raise
     except Exception:
         return None
 

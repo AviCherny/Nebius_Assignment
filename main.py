@@ -35,8 +35,8 @@ class Err(BaseModel):
 
 # ── llm setup ───────────────────────────────────────────────────────────────
 
-NEBIUS_URL = "https://api.studio.nebius.com/v1/"
-NEBIUS_MODEL = "meta-llama/Meta-Llama-3.1-70B-Instruct"
+NEBIUS_URL = "https://api.tokenfactory.nebius.com/v1/"
+NEBIUS_MODEL = os.environ.get("NEBIUS_MODEL") or "meta-llama/Meta-Llama-3.1-8B-Instruct"
 OPENAI_MODEL = "gpt-4.1-mini"
 
 def _llm() -> tuple[AsyncOpenAI, str]:
@@ -72,12 +72,31 @@ async def _ask_llm(context: str) -> dict:
         model=model,
         messages=[{"role": "system", "content": SYSTEM},
                   {"role": "user", "content": prompt}],
-        temperature=0.2,
+        temperature=0.0,
         max_tokens=2000,
     )
     raw = resp.choices[0].message.content.strip()
     log.info(f"LLM replied with {len(raw)} chars")
-    return _parse(raw)
+    try:
+        return _parse(raw)
+    except Exception:
+        log.warning("LLM returned invalid JSON; requesting repair")
+        repair = (
+            "Your previous response was invalid JSON. "
+            "Return ONLY valid JSON that matches the required schema. "
+            "Do not include markdown or extra text.\n\n"
+            f"Bad response:\n{raw}"
+        )
+        resp2 = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": SYSTEM},
+                      {"role": "user", "content": repair}],
+            temperature=0.0,
+            max_tokens=2000,
+        )
+        raw2 = resp2.choices[0].message.content.strip()
+        log.info(f"LLM repair replied with {len(raw2)} chars")
+        return _parse(raw2)
 
 
 def _parse(txt: str) -> dict:
